@@ -197,6 +197,141 @@ def explain_repository(root: str = ".", max_files: int = 60, max_chars_per_file:
 
     except Exception as e:
         return {"ok": False, "error": type(e).__name__, "message": str(e)}
+    
+
+def _safe_resolve(rel_path: str) -> Path:
+    """Resolve a relative path under BASE_DIR with sandbox protection."""
+    if rel_path.startswith("~") or rel_path.startswith("/"):
+        raise ValueError("InvalidPath: use a relative path.")
+    p = (BASE_DIR / rel_path).resolve()
+    if p != BASE_DIR and BASE_DIR not in p.parents:
+        raise PermissionError("SecurityError: path escapes sandbox.")
+    return p
+
+@mcp.tool
+def smart_search(
+    query: str,
+    root: str = ".",
+    use_regex: bool = False,
+    case_sensitive: bool = False,
+    max_hits: int = 50,
+    max_file_size_kb: int = 512,
+) -> dict:
+    """
+    Search across text files in the sandbox.
+    - Uses ripgrep (rg) if available (fast)
+    - Falls back to a Python scan if rg isn't installed
+    Returns: path, line number, and matching line snippet.
+    """
+    try:
+        root_path = _safe_resolve(root)
+        if not root_path.exists() or not root_path.is_dir():
+            return {"ok": False, "error": "NotFound", "message": f"Folder not found: {root}"}
+
+        # Prefer ripgrep if installed
+        rg_path = shutil.which("rg")
+        if rg_path:
+            rg_args = [rg_path, "--line-number", "--no-heading"]
+            if not case_sensitive:
+                rg_args.append("-i")
+            if not use_regex:
+                rg_args.append("--fixed-string")
+
+            # Don't search huge binaries; keep it friendly
+            rg_args += ["--max-filesize", f"{max_file_size_kb}K"]
+
+            rg_args += [query, "."]
+
+            proc = subprocess.run(
+                rg_args,
+                cwd=str(root_path),
+                capture_output=True,
+                text=True,
+            )
+
+            hits = []
+            for line in proc.stdout.splitlines():
+                parts = line.split(":", 2)  # file:line:text
+                if len(parts) == 3:
+                    pth, ln, txt = parts
+                    hits.append(
+                        {
+                            "path": str((Path(root) / pth).as_posix()),
+                            "line": int(ln),
+                            "text": txt.strip(),
+                        }
+                    )
+                    if len(hits) >= max_hits:
+                        break
+
+            return {
+                "ok": True,
+                "engine": "ripgrep",
+                "query": query,
+                "root": root,
+                "hits": hits,
+                "truncated": len(hits) >= max_hits,
+            }
+
+        # Python fallback
+        flags = 0 if case_sensitive else re.IGNORECASE
+        pattern = re.compile(query if use_regex else re.escape(query), flags=flags)
+
+        hits = []
+        # Scan common text-like files; you can expand later
+        exts = {".py", ".md", ".txt", ".toml", ".yaml", ".yml", ".json", ".env", ".ini", ".cfg"}
+
+        for fp in root_path.rglob("*"):
+            if not fp.is_file():
+                continue
+            if fp.suffix.lower() not in exts:
+                continue
+            # Skip very large files
+            try:
+                if fp.stat().st_size > max_file_size_kb * 1024:
+                    continue
+            except Exception:
+                continue
+
+            try:
+                with fp.open("r", encoding="utf-8", errors="ignore") as f:
+                    for i, line in enumerate(f, start=1):
+                        if pattern.search(line):
+                            hits.append(
+                                {
+                                    "path": str(fp.relative_to(BASE_DIR).as_posix()),
+                                    "line": i,
+                                    "text": line.strip(),
+                                }
+                            )
+                            if len(hits) >= max_hits:
+                                return {
+                                    "ok": True,
+                                    "engine": "python",
+                                    "query": query,
+                                    "root": root,
+                                    "hits": hits,
+                                    "truncated": True,
+                                }
+            except Exception:
+                continue
+
+        return {
+            "ok": True,
+            "engine": "python",
+            "query": query,
+            "root": root,
+            "hits": hits,
+            "truncated": False,
+        }
+
+    except ValueError as e:
+        return {"ok": False, "error": "InvalidPath", "message": str(e)}
+    except PermissionError as e:
+        return {"ok": False, "error": "SecurityError", "message": str(e)}
+    except Exception as e:
+        return {"ok": False, "error": type(e).__name__, "message": str(e)}
+
 
 
 # 4️⃣ Run server
